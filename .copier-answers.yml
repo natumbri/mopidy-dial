@@ -1,0 +1,8 @@
+_commit: v2.2.0
+_src_path: gh:mopidy/cookiecutter-mopidy-ext
+author_email: natumbri@gmail.com
+author_full_name: Nik Tumbri
+dist_name: mopidy-dial
+ext_name: dial
+github_username: natumbri
+short_description: Mopidy extension implementing SSDP/DIAL endpoint for mopidy-youtube

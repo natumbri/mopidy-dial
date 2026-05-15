@@ -2,7 +2,7 @@
 name = "mopidy-dial"
 description = "Mopidy extension implementing SSDP/DIAL endpoint for mopidy-youtube"
 readme = "README.md"
-requires-python = ">= 3.13"
+requires-python = ">= 3.12"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Nik Tumbri", email = "natumbri@gmail.com" }]
 classifiers = [
@@ -15,7 +15,7 @@ classifiers = [
 dynamic = ["version"]
 dependencies = [
     "mopidy >= 3.4.1",
-    "pykka >= 4.1",
+    "pykka >= 4.0",
 ]
 
 [project.urls]

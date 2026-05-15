@@ -23,6 +23,7 @@ class Extension(ext.Extension):
         # TODO: Comment in and edit, or remove entirely
         #schema["username"] = config.String()
         #schema["password"] = config.Secret()
+        schema["friendly_name"] = config.String()
         return schema
 
 
@@ -32,9 +33,10 @@ class Extension(ext.Extension):
 
         registry.add("frontend", DialFrontend)
         
-        # This maps /dial/<path> to your handler
+        # Mopidy expects a list of (regexp, handler_class) tuples
         registry.add("http:app", {
-            "name": "dial",
-            "handler": DialHandler,
-            "kwargs": {"core": self.core, "config": self.config} # Pass core and config here
+            "name": self.ext_name, # "dial"
+            "factory": lambda config, core: [
+                (r"/(.*)", DialHandler, {"config": config, "core": core}),
+            ],
         })

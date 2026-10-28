@@ -11,6 +11,7 @@ Routes (all relative to the /dial/ mount):
   OPTIONS /dial/*                    — CORS preflight
 """
 
+import time
 import urllib.parse
 import uuid
 import socket
@@ -54,15 +55,44 @@ def _device_desc_xml(friendly_name: str, local_ip: str, port: int,
 </root>"""
 
 
-def _app_info_xml(app_name: str, screen_id: str = "") -> str:
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
+def _app_info_xml(app_name: str, screen_id: str = "",
+                  lounge_token: str = "") -> str:
+    """
+    Build the DIAL app info XML response.
+
+    When session is bound (screen_id + lounge_token present):
+      - state=running with full additionalData
+      - App reads screenId/loungeToken and joins the lounge directly
+      - No POST needed — the app never POSTs when additionalData is present
+
+    When session not yet ready:
+      - state=stopped with no additionalData
+      - App will retry when it gets a 503 response
+    """
+    if screen_id and lounge_token:
+        # device_id may differ from screen_id — it's the stable physical device
+        # identifier that YouTube Music uses to recognise the receiver across sessions
+        dial_device_id = DialHandler.device_id or screen_id
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
 <service xmlns="urn:dial-multiscreen-org:schemas:dial">
   <name>{app_name}</name>
   <options allowStop="false"/>
   <state>running</state>
   <additionalData>
     <screenId>{screen_id}</screenId>
+    <deviceId>{dial_device_id}</deviceId>
+    <loungeToken>{lounge_token}</loungeToken>
+    <loungeTokenRefreshIntervalMs>1800000</loungeTokenRefreshIntervalMs>
+    <capabilities>dsp,que,mus</capabilities>
+    <mdxVersion>3</mdxVersion>
   </additionalData>
+</service>"""
+    else:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<service xmlns="urn:dial-multiscreen-org:schemas:dial">
+  <name>{app_name}</name>
+  <options allowStop="false"/>
+  <state>stopped</state>
 </service>"""
 
 
@@ -195,10 +225,15 @@ class DialHandler(tornado.web.RequestHandler):
     """
 
     # Shared across all handler instances (set by DialFrontend.on_start)
-    on_launch = None
+    on_launch = None          # called when app sends loungeToken directly
+    on_pairing_code = None    # called when app sends pairingCode (YouTube Music)
     screen_id = ""
+    device_id = ""            # physical device ID — separate from screen_id
     lounge_token = ""
     pairing_code = ""
+    # Time of the last pairingCode POST (YouTube Music launch flow)
+    last_pairing_launch = 0.0
+    PAIRING_LAUNCH_WINDOW = 120   # seconds the app is reported as running
     device_uuid = str(uuid.uuid4())
 
     # Current session/playback state — updated by LoungeHandler
@@ -236,7 +271,10 @@ class DialHandler(tornado.web.RequestHandler):
 
     def get(self, path):
         path = path.strip("/")
-        logger.info(f"DIAL GET /{path}")
+        # Log all headers so we can see exactly what YouTube Music sends
+        ua = self.request.headers.get("User-Agent", "")
+        origin = self.request.headers.get("Origin", "")
+        logger.debug(f"DIAL GET /{path}  UA={ua!r}  Origin={origin!r}")
 
         if path == "" or path == "index.html":
             self.set_header("Content-Type", "text/html; charset=utf-8")
@@ -254,15 +292,49 @@ class DialHandler(tornado.web.RequestHandler):
             )
             self.set_header("Content-Type", "application/xml")
             # This header tells the app where to POST launch requests
-            self.set_header(
-                "Application-URL",
-                f"http://{self.local_ip}:{self.port}/dial/apps/",
-            )
+            app_url = f"http://{self.local_ip}:{self.port}/dial/apps/"
+            self.set_header("Application-URL", app_url)
+            self.set_header("X-Application-URL", app_url)
             self.write(xml)
 
         elif path.startswith("apps/"):
             app_name = path.split("apps/", 1)[1].rstrip("/")
-            xml = _app_info_xml(app_name, DialHandler.screen_id)
+            if not DialHandler.screen_id or not DialHandler.lounge_token:
+                # Session not ready yet — return stopped state with no additionalData.
+                # Never return 503: the Music app caches the failure and gives up.
+                logger.debug("DIAL GET /apps/* before session ready — returning stopped")
+                self.set_header("Content-Type", "application/xml")
+                self.write("""<?xml version="1.0" encoding="UTF-8"?>
+<service xmlns="urn:dial-multiscreen-org:schemas:dial">
+  <name>YouTube</name>
+  <options allowStop="false"/>
+  <state>stopped</state>
+</service>""")
+                return
+            # YouTube Music ignores the "running + additionalData" shortcut
+            # that the YouTube app accepts. It needs to see the app stopped,
+            # POST a pairingCode, and then find us via that registered code.
+            is_music = "youtube.music" in ua.lower()
+            recently_launched = (
+                time.time() - DialHandler.last_pairing_launch
+                < DialHandler.PAIRING_LAUNCH_WINDOW
+            )
+            if is_music and not recently_launched:
+                logger.debug(f"DIAL GET /apps/{app_name} (YT Music) -> stopped")
+                self.set_header("Content-Type", "application/xml")
+                self.write(_app_info_xml(app_name))
+                return
+            if is_music:
+                # Launched: running, but no additionalData — that belongs to
+                # the YouTube screen, not the Music one.
+                self.set_header("Content-Type", "application/xml")
+                self.write(_app_info_xml(app_name).replace(
+                    "<state>stopped</state>", "<state>running</state>"))
+                return
+            xml = _app_info_xml(app_name, DialHandler.screen_id,
+                                   DialHandler.lounge_token)
+            logger.debug(f"DIAL GET /apps/{app_name} -> running, "
+                         f"screenId={DialHandler.screen_id!r}")
             self.set_header("Content-Type", "application/xml")
             self.write(xml)
 
@@ -272,10 +344,12 @@ class DialHandler(tornado.web.RequestHandler):
 
     def post(self, path):
         path = path.strip("/")
-        logger.info(f"DIAL POST /{path}")
+        ua = self.request.headers.get("User-Agent", "")
+        logger.debug(f"DIAL POST /{path}  UA={ua!r}")
 
         raw_body = self.request.body.decode("utf-8", errors="replace")
-        logger.info(f"DIAL POST body: {raw_body[:500]}")
+        logger.debug(f"DIAL POST headers: {dict(self.request.headers)}")
+        logger.debug(f"DIAL POST body: {raw_body[:300]}")
 
         params = urllib.parse.parse_qs(raw_body)
 
@@ -285,12 +359,28 @@ class DialHandler(tornado.web.RequestHandler):
         )
         screen_id = params.get("screenId", [None])[0]
         pairing_code = params.get("pairingCode", [None])[0]
+        theme = params.get("theme", [""])[0]
+        # Current YT Music builds send theme=cl and mark themselves with
+        # topic=music instead; older ones send theme=m.
+        if params.get("topic", [""])[0] == "music":
+            theme = "m"
 
-        logger.info(f"DIAL launch: loungeToken={lounge_token!r} "
-                    f"screenId={screen_id!r} pairingCode={pairing_code!r}")
+        app_name = path.split("apps/", 1)[-1].split("/")[0] if "apps/" in path else "unknown"
+        logger.info(f"DIAL launch from app={app_name!r} "
+                    f"screenId={screen_id!r} pairingCode={pairing_code!r} "
+                    f"loungeToken={'yes' if lounge_token else 'NO'}")
 
-        if lounge_token and DialHandler.on_launch:
-            DialHandler.on_launch(lounge_token, screen_id)
+        if lounge_token:
+            # YouTube app sends loungeIdToken directly — use it immediately
+            if DialHandler.on_launch:
+                DialHandler.on_launch(lounge_token, screen_id)
+        elif pairing_code:
+            # YouTube Music sends a pairingCode UUID — notify frontend
+            DialHandler.last_pairing_launch = time.time()
+            if DialHandler.on_pairing_code:
+                DialHandler.on_pairing_code(pairing_code, theme)
+        else:
+            logger.warning("DIAL POST had neither loungeToken nor pairingCode — ignoring")
 
         # 201 + Location is required by the DIAL spec
         location = (

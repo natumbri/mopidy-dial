@@ -10,6 +10,7 @@ accepts (event_name: str, event_args: dict)).
 
 import json
 import requests
+from mopidy_dial import logger
 from .lounge_session import LoungeSession, API_BASE
 
 
@@ -52,7 +53,7 @@ def _parse_chunk(raw: str) -> list:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"  Chunk parse error: {e} | raw[:120]={raw[:120]!r}")
+        logger.warning(f"Chunk parse error: {e} | raw[:120]={raw[:120]!r}")
         return []
 
     events = []
@@ -72,19 +73,21 @@ def _parse_chunk(raw: str) -> list:
                             pass
             events.append((event_id, event_name, event_args))
         except Exception as e:
-            print(f"  Event item parse error: {e} | item={item!r}")
+            logger.warning(f"Event item parse error: {e} | item={item!r}")
     return events
 
 
 class LoungeSubscriber:
-    def __init__(self, session: LoungeSession, handler):
+    def __init__(self, session: LoungeSession, handler, stop_event=None):
         """
-        session : LoungeSession — shared state updated as events arrive
-        handler : callable(event_name: str, event_args: dict)
-                  or an object with on_event(event_name, event_args)
+        session    : LoungeSession — shared state updated as events arrive
+        handler    : callable(event_name, event_args) or object with on_event()
+        stop_event : threading.Event — set this to interrupt the subscribe loop
+                     cleanly without waiting for the 65s timeout to expire
         """
         self.session = session
         self._handler = handler
+        self._stop_event = stop_event
 
     def _dispatch(self, event_name: str, event_args):
         if callable(self._handler):
@@ -102,6 +105,9 @@ class LoungeSubscriber:
         url = f"{API_BASE}/bc/bind"
 
         while True:
+            if self._stop_event and self._stop_event.is_set():
+                return "stopped"
+
             params = {
                 **s.common_query_params,
                 "RID": "rpc",
@@ -109,7 +115,6 @@ class LoungeSubscriber:
                 "AID": s.aid,
                 "TYPE": "xmlhttp",
             }
-            print(f"\nSubscribing (AID={s.aid})...")
 
             try:
                 with requests.get(
@@ -117,15 +122,15 @@ class LoungeSubscriber:
                     params=params,
                     headers=s.common_headers,
                     stream=True,
-                    timeout=65,
+                    timeout=35,  # shorter timeout = faster shutdown response
                 ) as resp:
-                    print(f"Status: {resp.status_code} {resp.reason}")
+                    logger.debug(f"Status: {resp.status_code} {resp.reason}")
 
                     if resp.status_code == 400:
-                        print("Got 400 — SID is stale. Rebind needed.")
+                        logger.warning("Got 400 — SID is stale. Rebind needed.")
                         return "rebind"
                     if resp.status_code == 401:
-                        print("Got 401 — lounge token expired.")
+                        logger.error("Got 401 — lounge token expired.")
                         return "expired"
 
                     pending = ""
@@ -156,9 +161,13 @@ class LoungeSubscriber:
                                 self._dispatch(event_name, event_args)
 
             except requests.exceptions.Timeout:
-                print("Subscribe timeout — reconnecting")
+                if self._stop_event and self._stop_event.is_set():
+                    return "stopped"
+                # Normal timeout — just reconnect
             except requests.exceptions.ConnectionError as e:
-                print(f"Connection error: {e} — reconnecting")
+                if self._stop_event and self._stop_event.is_set():
+                    return "stopped"
+                from mopidy_dial import logger as _log
+                _log.warning(f"Lounge connection error: {e} — reconnecting")
             except KeyboardInterrupt:
-                print("\nKeyboardInterrupt — stopping subscriber")
                 return "stopped"

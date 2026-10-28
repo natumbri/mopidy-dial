@@ -8,6 +8,7 @@ gsessionid, AID, RID) to build the correct request.
 
 import urllib.request
 import urllib.parse
+from mopidy_dial import logger
 from .lounge_session import LoungeSession, API_BASE
 
 
@@ -21,15 +22,24 @@ class LoungeCommander:
         Returns True on success, False on failure.
         """
         s = self.session
+        with s.send_lock:
+            return self._send_locked(sc, params)
+
+    def _send_locked(self, sc: str, params: dict) -> bool:
+        s = self.session
+        rid = s.rid
+        s.rid += 1  # RIDs are consumed even if the request fails
+        ofs = s.ofs
+        s.ofs += 1
         query = urllib.parse.urlencode({
             **s.common_query_params,
-            "RID": s.rid,
+            "RID": rid,
             "AID": s.aid,
             "CVER": "1",
         })
         url = f"{API_BASE}/bc/bind?{query}"
 
-        body = {"count": "1", "req0__sc": sc}
+        body = {"count": "1", "ofs": str(ofs), "req0__sc": sc}
         for k, v in params.items():
             body[f"req0_{k}"] = str(v)
 
@@ -41,13 +51,12 @@ class LoungeCommander:
 
         try:
             req = urllib.request.Request(url, data=payload, headers=headers)
-            resp = urllib.request.urlopen(req)
-            resp.read()
-            s.rid += 1
-            print(f"  → Sent '{sc}' OK")
+            resp = urllib.request.urlopen(req, timeout=15)
+            reply = resp.read()
+            logger.debug(f"Sent '{sc}' OK (RID={rid} ofs={ofs}) {params} -> {resp.status} {reply[:120]!r}")
             return True
         except Exception as e:
-            print(f"  → Failed to send '{sc}': {e}")
+            logger.warning(f"Failed to send '{sc}' (RID={rid}): {e}")
             return False
 
     # --- Convenience wrappers ---

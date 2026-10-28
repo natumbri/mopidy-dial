@@ -5,15 +5,20 @@ Mopidy frontend actor. Responsible for:
   1. Running the SSDP listener/notifier (makes device visible on LAN)
   2. Creating and managing the Lounge session
   3. Wiring the DIAL HTTP handler (web.py) to the Lounge session
+  4. Forwarding Mopidy CoreListener events to the active LoungeHandler
+     so that Mopidy-side changes (play/pause/seek/volume) are reported
+     back to the YouTube app in real time.
 """
 
+import os
 import socket
 import struct
 import threading
 import time
+
 import pykka
 
-from mopidy import core
+from mopidy import core as mopidy_core
 from mopidy_dial import logger
 
 from .lounge_session import LoungeSession
@@ -35,7 +40,7 @@ def _local_ip() -> str:
         s.close()
 
 
-class DialFrontend(pykka.ThreadingActor, core.CoreListener):
+class DialFrontend(pykka.ThreadingActor, mopidy_core.CoreListener):
 
     def __init__(self, config, core):
         super().__init__()
@@ -45,8 +50,14 @@ class DialFrontend(pykka.ThreadingActor, core.CoreListener):
         self.port = config["http"]["port"]
         self.friendly_name = config.get("dial", {}).get("friendly_name", "Mopidy")
         self._running = False
-        self._session = None
-        self._subscriber_thread = None
+        self._stop_event = threading.Event()
+
+        # One Lounge session (and handler) per sender type, keyed by theme:
+        # "" for the YouTube app, "m" for YouTube Music. CoreListener events
+        # are forwarded to whichever handlers have a remote connected.
+        self._sessions: dict[str, LoungeSession] = {}
+        self._handlers: dict[str, LoungeHandler] = {}
+        self._handler_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Pykka lifecycle
@@ -54,35 +65,89 @@ class DialFrontend(pykka.ThreadingActor, core.CoreListener):
 
     def on_start(self):
         self._running = True
-
-        # Wire the on_launch callback into the shared DialHandler class
+        self._session_ready = threading.Event()
         DialHandler.on_launch = self._on_dial_launch
+        DialHandler.on_pairing_code = self._on_dial_pairing_code
 
-        # Start SSDP in background threads
+        # SSDP listener starts immediately (must respond to M-SEARCH)
         threading.Thread(target=self._run_ssdp, daemon=True).start()
+        # NOTIFY thread waits until session is ready before announcing
         threading.Thread(target=self._run_notify, daemon=True).start()
-
-        # Start the manual PIN pairing session
         threading.Thread(target=self._start_lounge_session, daemon=True).start()
 
     def on_stop(self):
         self._running = False
+        self._stop_event.set()  # wake any threads sleeping on this event
+
+    # ------------------------------------------------------------------
+    # CoreListener — Mopidy → YouTube direction
+    # Each event is forwarded to the active LoungeHandler.
+    # ------------------------------------------------------------------
+
+    def _forward(self, event: str, *args):
+        with self._handler_lock:
+            handlers = [h for h in self._handlers.values() if h.connected]
+        for h in handlers:
+            getattr(h, event)(*args)
+
+    def track_playback_started(self, tl_track):
+        self._forward("on_track_playback_started", tl_track)
+
+    def track_playback_paused(self, tl_track, time_position):
+        self._forward("on_track_playback_paused", tl_track, time_position)
+
+    def track_playback_resumed(self, tl_track, time_position):
+        self._forward("on_track_playback_resumed", tl_track, time_position)
+
+    def track_playback_ended(self, tl_track, time_position):
+        self._forward("on_track_playback_ended", tl_track, time_position)
+
+    def seeked(self, time_position):
+        self._forward("on_seeked", time_position)
+
+    def volume_changed(self, volume):
+        self._forward("on_volume_changed", volume)
+
+    def mute_changed(self, mute):
+        self._forward("on_mute_changed", mute)
 
     # ------------------------------------------------------------------
     # DIAL launch callback (called from web.py when app POSTs)
     # ------------------------------------------------------------------
 
     def _on_dial_launch(self, lounge_token: str, screen_id: str):
-        """
-        Called when a YouTube app on the LAN taps cast and POSTs to /dial/apps/YouTube.
-        Starts (or restarts) a Lounge session with the app-provided token.
-        """
-        logger.info(f"DIAL launch received — screenId={screen_id!r}")
+        """Called when YouTube app POSTs with a loungeToken directly."""
+        logger.info(f"DIAL launch (token flow) — screenId={screen_id!r}")
         threading.Thread(
             target=self._run_session,
             args=(screen_id, lounge_token),
             daemon=True,
         ).start()
+
+    def _on_dial_pairing_code(self, pairing_code: str, theme: str = ""):
+        """
+        Called when a sender POSTs a pairingCode to launch the app over DIAL.
+
+        The code is generated by the sender. A real TV registers it with
+        YouTube against its own screen, and the sender then looks the screen
+        up by that code and connects to it. YouTube Music (theme "m") only
+        connects to a screen created with that theme, so register the code on
+        the matching session.
+        """
+        session = self._sessions.get(theme if theme == "m" else "")
+        logger.info(f"DIAL launch — theme={theme!r} pairingCode={pairing_code!r}")
+        if session is None:
+            logger.warning(f"No Lounge session for theme {theme!r} yet")
+            return
+
+        def register():
+            try:
+                session.register_pairing_code(pairing_code)
+            except Exception as e:
+                logger.error(f"Failed to register pairing code: {e}",
+                             exc_info=True)
+
+        threading.Thread(target=register, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Lounge session management
@@ -90,32 +155,111 @@ class DialFrontend(pykka.ThreadingActor, core.CoreListener):
 
     def _start_lounge_session(self):
         """
-        Create a self-registered Lounge session for manual PIN pairing.
-        Runs in a background thread so it doesn't block on_start().
+        Create a persistent lounge session with automatic pairing code refresh.
+        Credentials are only published to DialHandler (and SSDP only fires)
+        after the session is fully bound — preventing the race condition where
+        the Music app polls and receives empty credentials.
         """
         try:
-            session = LoungeSession.create(self.friendly_name)
-            code = session.get_pairing_code()
-            logger.info(f"YouTube pairing code: {code}")
-            logger.info("Enter this code in YouTube → Settings → Watch on TV")
+            # Persist screen_id so YouTube Music can reconnect after restarts
+            persist_path = os.path.join(
+                os.path.expanduser("~"), ".config", "mopidy", "dial_screen_id"
+            )
+            session = LoungeSession.create(self.friendly_name,
+                                           persist_path=persist_path)
 
-            # Expose session info to the DIAL handler for the status page
-            DialHandler.screen_id = session.screen_id
+            # Get + register pairing code BEFORE publishing credentials
+            self._sessions[""] = session
+            self._refresh_pairing_code(session)
+
+            # Bind the lounge session first
+            session.bind()
+            logger.info(f"Lounge session bound — SID={session.sid}")
+
+            # NOW publish credentials — 503 guard will clear on next poll
             DialHandler.lounge_token = session.lounge_token
-            DialHandler.pairing_code = code
+            DialHandler.screen_id    = session.screen_id
+            DialHandler.device_id    = session.device_id
 
-            self._run_session(session.screen_id, session.lounge_token,
-                              session=session)
+            # Signal SSDP notify thread that it can start broadcasting
+            self._session_ready.set()
+
+            # Start pairing code refresh thread
+            threading.Thread(
+                target=self._pairing_code_refresher,
+                args=(session,),
+                daemon=True,
+            ).start()
+
+            handler = LoungeHandler(session, self.core)
+            with self._handler_lock:
+                self._handlers[""] = handler
+            threading.Thread(target=self._start_music_session,
+                             daemon=True).start()
+            self._run_subscriber(session, handler)
         except Exception as e:
             logger.error(f"Failed to start Lounge session: {e}", exc_info=True)
 
+    def _start_music_session(self):
+        """A second screen with theme "m", which YouTube Music connects to."""
+        try:
+            persist_path = os.path.join(
+                os.path.expanduser("~"), ".config", "mopidy",
+                "dial_screen_id_music"
+            )
+            session = LoungeSession.create(
+                self.friendly_name, persist_path=persist_path, theme="m")
+            session.bind()
+            logger.info(f"Lounge session (YouTube Music) bound — "
+                        f"SID={session.sid}")
+            self._sessions["m"] = session
+            handler = LoungeHandler(session, self.core)
+            with self._handler_lock:
+                self._handlers["m"] = handler
+            self._run_subscriber(session, handler)
+        except Exception as e:
+            logger.error(f"Failed to start YouTube Music session: {e}",
+                         exc_info=True)
+
+    def _run_subscriber(self, session: LoungeSession, handler: LoungeHandler):
+        """Listen for events, rebinding when the SID goes stale."""
+        while self._running:
+            result = LoungeSubscriber(
+                session, handler, self._stop_event).run_forever()
+            logger.info(f"Lounge subscriber (theme={session.theme!r}) "
+                        f"exited: {result}")
+            if result != "rebind":
+                return
+            logger.info("Rebinding session...")
+            try:
+                session.bind()
+            except Exception as e:
+                logger.error(f"Rebind failed: {e}", exc_info=True)
+                return
+
+    def _refresh_pairing_code(self, session: LoungeSession):
+        try:
+            code = session.get_pairing_code()
+            DialHandler.pairing_code = code
+            logger.info(f"YouTube pairing code: {code} "
+                        f"(enter in YouTube → Settings → Watch on TV)")
+        except Exception as e:
+            logger.warning(f"Failed to refresh pairing code: {e}")
+
+    def _pairing_code_refresher(self, session: LoungeSession):
+        """Refresh the pairing code every 4 minutes while running."""
+        while self._running:
+            # Sleep in short intervals so we respond to shutdown quickly
+            for _ in range(240):  # 240 × 1s = 4 minutes
+                if not self._running:
+                    return
+                time.sleep(1)
+            if self._running:
+                self._refresh_pairing_code(session)
+
     def _run_session(self, screen_id: str, lounge_token: str,
                      session: LoungeSession = None):
-        """
-        Bind and subscribe with the given credentials.
-        If session is None, create a new one from the provided tokens
-        (used for DIAL-launched sessions where the app supplies the token).
-        """
+        handler = None
         try:
             if session is None:
                 session = LoungeSession(screen_id, lounge_token,
@@ -124,24 +268,22 @@ class DialFrontend(pykka.ThreadingActor, core.CoreListener):
             logger.info(f"Lounge session bound — SID={session.sid}")
 
             handler = LoungeHandler(session, self.core)
-            subscriber = LoungeSubscriber(session, handler)
-            result = subscriber.run_forever()
-            logger.info(f"Lounge subscriber exited: {result}")
-
-            if result == "rebind":
-                # SID stale — re-bind and continue
-                logger.info("Rebinding session...")
-                self._run_session(screen_id, lounge_token)
-
+            with self._handler_lock:
+                self._handlers["token"] = handler
+            self._run_subscriber(session, handler)
         except Exception as e:
             logger.error(f"Lounge session error: {e}", exc_info=True)
+        finally:
+            with self._handler_lock:
+                self._handlers.pop("token", None)
 
     # ------------------------------------------------------------------
-    # SSDP — respond to M-SEARCH from apps on the LAN
+    # SSDP
     # ------------------------------------------------------------------
 
     def _ssdp_response(self) -> bytes:
-        location = f"http://{self.local_ip}:{self.port}/dial/ssdp/device-desc.xml"
+        location = (f"http://{self.local_ip}:{self.port}"
+                    f"/dial/ssdp/device-desc.xml")
         return (
             "HTTP/1.1 200 OK\r\n"
             f"LOCATION: {location}\r\n"
@@ -186,8 +328,8 @@ class DialFrontend(pykka.ThreadingActor, core.CoreListener):
         sock.close()
 
     def _run_notify(self):
-        """Send periodic NOTIFY alive so apps keep seeing the device."""
-        location = f"http://{self.local_ip}:{self.port}/dial/ssdp/device-desc.xml"
+        location = (f"http://{self.local_ip}:{self.port}"
+                    f"/dial/ssdp/device-desc.xml")
 
         def packet(nts="ssdp:alive"):
             return (
@@ -204,6 +346,15 @@ class DialFrontend(pykka.ThreadingActor, core.CoreListener):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
                              socket.IPPROTO_UDP)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+
+        # Wait until the lounge session is fully bound before announcing.
+        # This prevents apps from discovering us, polling /apps/YouTube,
+        # and reading empty credentials due to a startup race condition.
+        logger.debug("SSDP notify waiting for session to be ready...")
+        self._session_ready.wait(timeout=30)
+        if not self._running:
+            return
+        logger.info("SSDP notify: session ready, starting announcements")
 
         for _ in range(3):
             sock.sendto(packet(), (SSDP_ADDR, SSDP_PORT))

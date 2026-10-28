@@ -30,6 +30,7 @@ Mopidy → YouTube (via CoreListener events in frontend.py):
 URI scheme used for mopidy-youtube: yt:video:<video_id>
 """
 
+import re
 import secrets
 import threading
 import time
@@ -42,6 +43,19 @@ from mopidy_dial import logger
 
 def _yt_uri(video_id: str) -> str:
     return f"yt:video:{video_id}"
+
+
+_VIDEO_URI_RE = re.compile(r"^(?:yt|youtube):video[:/]([\w-]+)$")
+
+
+def _video_id(track) -> str:
+    """Video id of a Mopidy track (mopidy-youtube uses youtube:video:<id>)."""
+    m = _VIDEO_URI_RE.match(track.uri or "")
+    return m.group(1) if m else (track.comment or "")
+
+
+def _flag(value: bool) -> str:
+    return "true" if value else "false"
 
 
 def _ms_to_sec(ms) -> str:
@@ -75,6 +89,11 @@ class LoungeHandler:
         self.state = "-1"           # -1=idle, 1=playing, 2=paused, 3=buffering
         self.volume = 50
         self.muted = False
+
+        # Serialises queue edits, which can take a while (each added video
+        # is looked up). _queue_gen invalidates a fill when a newer one starts.
+        self._queue_lock = threading.Lock()
+        self._queue_gen = 0
 
         # True while a remote (phone) is connected to this session
         self.connected = False
@@ -299,23 +318,13 @@ class LoungeHandler:
 
         if self.core:
             try:
-                # Clear existing queue and load the new video
-                self.core.tracklist.clear().get()
-                tl_tracks = self.core.tracklist.add(
-                    uris=[_yt_uri(video_id)]
-                ).get()
-
-                if tl_tracks:
-                    tlid = tl_tracks[0].tlid
-                    if start_paused:
-                        # Play then immediately pause so mopidy-youtube resolves
-                        # the stream URI, then we pause on track_playback_started
-                        self._pending_pause = True
-                        self.core.playback.play(tlid=tlid).get()
-                    else:
-                        self._pending_pause = False
-                        self.core.playback.play(tlid=tlid).get()
-
+                ids, index = self._parse_queue(args)
+                tlid = self._load_queue(ids, index)
+                if tlid is not None:
+                    # Play then immediately pause so mopidy-youtube resolves
+                    # the stream URI, if the sender didn't ask for playback
+                    self._pending_pause = start_paused
+                    self.core.playback.play(tlid=tlid).get()
                     self._watch_for_start(video_id)
 
                     if start_time and float(start_time) > 0:
@@ -323,7 +332,7 @@ class LoungeHandler:
                             time_position=_sec_to_ms(start_time)
                         ).get()
                 else:
-                    logger.error(f"tracklist.add returned no tracks for {video_id!r}")
+                    logger.error(f"No playable tracks for {video_id!r}")
                     self._report_idle()
 
             except Exception as e:
@@ -387,56 +396,149 @@ class LoungeHandler:
             except Exception as e:
                 logger.error(f"removeVideo error: {e}", exc_info=True)
 
+    # -------------------------------------------------------------------------
+    # Queue handling
+    #
+    # setPlaylist and updatePlaylist both carry the whole queue as a
+    # comma-separated `videoIds`, plus `currentIndex`. "Add to queue" and
+    # "play next" arrive as updatePlaylist with the new list.
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_queue(args: dict) -> tuple[list[str], int]:
+        """Return (video ids, index of the current one) from a message."""
+        ids = [v for v in str(args.get("videoIds", "")).split(",") if v]
+        current = args.get("videoId", "")
+        if current and current not in ids:
+            ids = [current]
+        if not ids:
+            return [], 0
+        try:
+            index = int(args.get("currentIndex", ""))
+        except (TypeError, ValueError):
+            index = -1
+        if not 0 <= index < len(ids) or (current and ids[index] != current):
+            index = ids.index(current) if current in ids else 0
+        return ids, index
+
+    def _tracklist_ids(self) -> tuple[list, list[str]]:
+        tl_tracks = self.core.tracklist.get_tl_tracks().get()
+        return tl_tracks, [_video_id(t.track) for t in tl_tracks]
+
+    def _load_queue(self, ids: list[str], index: int):
+        """
+        Make the Mopidy tracklist match `ids` and return the tlid of
+        ids[index]. The current video is added first so playback can begin
+        straight away; the rest is filled in on a background thread.
+        """
+        if not ids:
+            return None
+        with self._queue_lock:
+            self._queue_gen += 1
+            tl_tracks, have = self._tracklist_ids()
+            if have == ids:
+                return tl_tracks[index].tlid  # same queue, just jump
+
+            self.core.tracklist.clear().get()
+            added = self.core.tracklist.add(
+                uris=[_yt_uri(ids[index])]).get()
+            if not added:
+                return None
+            tlid = added[0].tlid
+            gen = self._queue_gen
+
+        if len(ids) > 1:
+            threading.Thread(
+                target=self._fill_queue, args=(ids, index, gen),
+                daemon=True,
+            ).start()
+        return tlid
+
+    def _fill_queue(self, ids: list[str], index: int, gen: int):
+        """Add the videos before and after the current one."""
+        try:
+            with self._queue_lock:
+                if gen != self._queue_gen:
+                    return
+                before = [_yt_uri(v) for v in ids[:index]]
+                after = [_yt_uri(v) for v in ids[index + 1:]]
+                if before:
+                    self.core.tracklist.add(uris=before, at_position=0).get()
+                if after:
+                    self.core.tracklist.add(uris=after).get()
+            logger.info(f"Queue loaded: {len(ids)} video(s)")
+            self._refresh_queue_position()
+        except Exception as e:
+            logger.error(f"Filling queue failed: {e}", exc_info=True)
+
     def _handle_update_playlist(self, args: dict):
-        """
-        Handle mdxQueueOperations — the YouTube queue management protocol.
-        Operations include ADD, REMOVE, MOVE, and SET_VIDEO_LIST.
-        """
-        if not isinstance(args, dict):
+        """Queue edit from the remote: add, remove or reorder videos."""
+        if not isinstance(args, dict) or not self.core:
             return
-        operations = args.get("mdxQueueOperations", [])
-        logger.info(f"updatePlaylist: {len(operations)} operation(s)")
+        ids, _ = self._parse_queue(args)
+        if not ids:
+            return
+        logger.info(f"updatePlaylist: {len(ids)} video(s)")
+        self.current_list_id = args.get("listId", self.current_list_id)
+        self.ctt = args.get("ctt", self.ctt)
+        threading.Thread(target=self._sync_queue, args=(ids,),
+                         daemon=True).start()
 
-        for op in operations:
-            try:
-                op_type = op.get("type", "")
-                videos  = op.get("videos", [])
+    def _sync_queue(self, ids: list[str]):
+        """Edit the tracklist, minimally, until it matches `ids`."""
+        try:
+            with self._queue_lock:
+                self._queue_gen += 1  # supersede any fill in progress
+                tl_tracks, have = self._tracklist_ids()
 
-                if op_type in ("ADD", "INSERT"):
-                    for v in videos:
-                        vid = v.get("externalVideoId") or v.get("videoId", "")
-                        if vid:
-                            logger.info(f"  updatePlaylist ADD: {vid!r}")
-                            if self.core:
-                                self.core.tracklist.add(
-                                    uris=[_yt_uri(vid)]
-                                ).get()
+                # Remove tracks that are no longer queued
+                wanted = {}
+                for v in ids:
+                    wanted[v] = wanted.get(v, 0) + 1
+                drop = []
+                for t, v in zip(tl_tracks, have):
+                    if wanted.get(v, 0) > 0:
+                        wanted[v] -= 1
+                    else:
+                        drop.append(t.tlid)
+                if drop:
+                    self.core.tracklist.remove(criteria={"tlid": drop}).get()
 
-                elif op_type == "REMOVE":
-                    for v in videos:
-                        vid = v.get("externalVideoId") or v.get("videoId", "")
-                        if vid and self.core:
-                            self.core.tracklist.remove(
-                                criteria={"uri": [_yt_uri(vid)]}
-                            ).get()
+                # Then add / move into place, front to back
+                for i, v in enumerate(ids):
+                    _, now = self._tracklist_ids()
+                    if i < len(now) and now[i] == v:
+                        continue
+                    if v in now[i + 1:]:
+                        j = i + 1 + now[i + 1:].index(v)
+                        self.core.tracklist.move(
+                            start=j, end=j + 1, to_position=i).get()
+                    else:
+                        self.core.tracklist.add(
+                            uris=[_yt_uri(v)], at_position=i).get()
+            self._refresh_queue_position()
+        except Exception as e:
+            logger.error(f"updatePlaylist error: {e}", exc_info=True)
 
-                elif op_type == "SET_VIDEO_LIST":
-                    # Full queue replacement
-                    if self.core:
-                        self.core.tracklist.clear().get()
-                        uris = [
-                            _yt_uri(v.get("externalVideoId") or v.get("videoId", ""))
-                            for v in videos
-                            if v.get("externalVideoId") or v.get("videoId")
-                        ]
-                        if uris:
-                            self.core.tracklist.add(uris=uris).get()
-
-                else:
-                    logger.debug(f"  updatePlaylist: unhandled op type {op_type!r}")
-
-            except Exception as e:
-                logger.error(f"updatePlaylist op error: {e}", exc_info=True)
+    def _refresh_queue_position(self, report: bool = True):
+        """Tell the remote where we are in the queue and what's around it."""
+        try:
+            current = self.core.playback.get_current_tl_track().get()
+            length = self.core.tracklist.get_length().get()
+            index = (self.core.tracklist.index(tlid=current.tlid).get()
+                     if current else None)
+        except Exception:
+            return
+        if index is not None:
+            self.current_index = str(index)
+        has_prev = index is not None and index > 0
+        has_next = index is not None and index < length - 1
+        self.commander.send("onHasPreviousNextChanged", {
+            "hasPrevious": _flag(has_prev),
+            "hasNext":     _flag(has_next),
+        })
+        if report and self.state in ("1", "2"):
+            self._report_state(also_now_playing=True)
 
     def _handle_play(self):
         logger.info("play")
@@ -624,6 +726,7 @@ class LoungeHandler:
         self._report_state(also_now_playing=True)
         if self.state == "1":
             self._start_ticker()
+        self._refresh_queue_position(report=False)
 
     def on_track_playback_paused(self, tl_track, time_position):
         """Mopidy paused — report paused state to Lounge."""
